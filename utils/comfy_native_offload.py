@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Optional, Any
 
 import torch
+import logging
 
 
 def _estimate_model_size_bytes(model: torch.nn.Module) -> int:
@@ -97,7 +98,7 @@ class ComfyNativeOffloadCallable:
         try:
             self._load_device = torch.device(device)
         except Exception:
-            pass
+            logging.warning(f"ComfyNativeOffloadCallable.to(): invalid device {device}, keeping previous {self._load_device}")
         return self
 
     def cpu(self):
@@ -106,7 +107,22 @@ class ComfyNativeOffloadCallable:
             try:
                 self._mm.unload_model(self.patcher)
             except Exception:
-                pass
+                logging.warning("ComfyNativeOffloadCallable.cpu(): failed to unload model")
+        elif hasattr(self._mm, "current_loaded_models"):
+            try:
+                model_to_remove = None
+                for loaded_model in self._mm.current_loaded_models:
+                    if loaded_model.model is self.patcher:
+                        all_unloaded = loaded_model.model_unload()
+                        if all_unloaded:
+                            model_to_remove = loaded_model
+                        break
+                if model_to_remove is not None:
+                    self._mm.current_loaded_models.remove(model_to_remove)
+            except Exception:
+                logging.warning("ComfyNativeOffloadCallable.cpu(): failed to unload model from current_loaded_models")
+        else:
+            logging.warning("ComfyNativeOffloadCallable.cpu(): no known unload method in model_management")
         return self
 
     def cuda(self, device: Optional[int] = None):
