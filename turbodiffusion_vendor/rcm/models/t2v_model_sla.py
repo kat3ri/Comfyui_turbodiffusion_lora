@@ -56,7 +56,14 @@ from rcm.configs.defaults.ema import EMAConfig
 from rcm.samplers.euler import FlowEulerSampler
 from rcm.samplers.unipc import FlowUniPCMultistepSampler
 from rcm.networks.wan2pt1 import WanSelfAttention
-from SLA import SparseLinearAttention
+# SLA is a vendored local module defined in turbodiffusion_vendor/SLA/ — not a
+# pip package.  Relative import makes that explicit; the bare-name fallback
+# covers direct script / training execution where turbodiffusion_vendor/ is on
+# sys.path.
+try:
+    from ...SLA import SparseLinearAttention
+except ImportError:
+    from SLA import SparseLinearAttention
 
 torch._dynamo.config.suppress_errors = True
 

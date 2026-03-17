@@ -1,25 +1,53 @@
 import argparse
 
 import torch
-from rcm.utils.model_utils import load_state_dict
-from rcm.networks.wan2pt1 import (
-    WanModel as WanModel2pt1,
-    WanLayerNorm as WanLayerNorm2pt1,
-    WanRMSNorm as WanRMSNorm2pt1,
-    WanSelfAttention as WanSelfAttention2pt1
-)
-from rcm.networks.wan2pt2 import (
-    WanModel as WanModel2pt2,
-    WanLayerNorm as WanLayerNorm2pt2,
-    WanRMSNorm as WanRMSNorm2pt2,
-    WanSelfAttention as WanSelfAttention2pt2
-)
 
-from ops import FastLayerNorm, FastRMSNorm, Int8Linear
-from SLA import (
-    SparseLinearAttention as SLA,
-    SageSparseLinearAttention as SageSLA
-)
+# SLA and ops are vendored local modules defined inside this repository under
+# turbodiffusion_vendor/SLA/ and turbodiffusion_vendor/ops/ — they are NOT
+# external pip packages.  When this file is imported as part of a parent package
+# we use explicit relative imports so the local nature is unambiguous.  The
+# bare-name fallback keeps the file runnable as a standalone script when
+# turbodiffusion_vendor/ is already on sys.path.
+try:
+    from ..rcm.utils.model_utils import load_state_dict
+    from ..rcm.networks.wan2pt1 import (
+        WanModel as WanModel2pt1,
+        WanLayerNorm as WanLayerNorm2pt1,
+        WanRMSNorm as WanRMSNorm2pt1,
+        WanSelfAttention as WanSelfAttention2pt1
+    )
+    from ..rcm.networks.wan2pt2 import (
+        WanModel as WanModel2pt2,
+        WanLayerNorm as WanLayerNorm2pt2,
+        WanRMSNorm as WanRMSNorm2pt2,
+        WanSelfAttention as WanSelfAttention2pt2
+    )
+    from ..ops import FastLayerNorm, FastRMSNorm, Int8Linear
+    from ..SLA import (
+        SparseLinearAttention as SLA,
+        SageSparseLinearAttention as SageSLA
+    )
+except ImportError:
+    # Fallback for direct script execution: turbodiffusion_vendor/ must be on
+    # sys.path (the base-repo convention when running from that directory).
+    from rcm.utils.model_utils import load_state_dict
+    from rcm.networks.wan2pt1 import (
+        WanModel as WanModel2pt1,
+        WanLayerNorm as WanLayerNorm2pt1,
+        WanRMSNorm as WanRMSNorm2pt1,
+        WanSelfAttention as WanSelfAttention2pt1
+    )
+    from rcm.networks.wan2pt2 import (
+        WanModel as WanModel2pt2,
+        WanLayerNorm as WanLayerNorm2pt2,
+        WanRMSNorm as WanRMSNorm2pt2,
+        WanSelfAttention as WanSelfAttention2pt2
+    )
+    from ops import FastLayerNorm, FastRMSNorm, Int8Linear
+    from SLA import (
+        SparseLinearAttention as SLA,
+        SageSparseLinearAttention as SageSLA
+    )
 
 
 def replace_attention(
@@ -117,9 +145,21 @@ def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
         net = select_model(args.model)
 
     state_dict = load_state_dict(dit_path)
+
+    # Auto-detect whether the checkpoint already contains pre-quantized Int8Linear
+    # weights (indicated by the presence of 'int8_weight' keys).  The module
+    # structure installed before load_state_dict must match the checkpoint keys:
+    #   - pre-quantized checkpoint  → install Int8Linear structure (int8_weight / scale)
+    #   - plain float checkpoint    → keep nn.Linear structure (weight)
+    checkpoint_is_quantized = any("int8_weight" in k for k in state_dict)
+
     if args.attention_type in ['sla', 'sagesla']:
         net = replace_attention(net, attention_type=args.attention_type, sla_topk=args.sla_topk)
-    replace_linear_norm(net, replace_linear=args.quant_linear, replace_norm=not args.default_norm, quantize=False)
+
+    # Install Int8Linear module structure only when the checkpoint already uses
+    # int8_weight keys.  For plain float checkpoints, always load with standard
+    # nn.Linear first to avoid key mismatches.
+    replace_linear_norm(net, replace_linear=checkpoint_is_quantized, replace_norm=not args.default_norm, quantize=False)
     net.load_state_dict(state_dict, assign=True)
     net = net.to(tensor_kwargs["device"]).eval()
     del state_dict

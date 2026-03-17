@@ -121,7 +121,6 @@ class TurboWanModelLoader:
                 self.attention_type = attention_type
                 self.sla_topk = sla_topk
                 self.offload_mode = offload_mode
-                self.quant_linear = True  # Models are quantized
                 self.default_norm = False
 
         args = Args()
@@ -184,9 +183,21 @@ class TurboWanModelLoader:
             state_dict = cleaned_state_dict
             logger.log(f"Cleaned {len(state_dict)} state dict keys")
 
-            # Apply quantization-aware layer replacements
-            logger.log(f"Applying quantization-aware replacements (quant_linear={args.quant_linear}, fast_norm={not args.default_norm})...")
-            replace_linear_norm(model_arch, replace_linear=args.quant_linear, replace_norm=not args.default_norm, quantize=False)
+            # Auto-detect whether the checkpoint already contains pre-quantized
+            # Int8Linear weights (indicated by the presence of 'int8_weight' keys).
+            # The module structure installed before load_state_dict must match the
+            # checkpoint keys:
+            #   - pre-quantized checkpoint  → install Int8Linear structure (int8_weight / scale)
+            #   - plain float checkpoint    → keep nn.Linear structure (weight)
+            checkpoint_is_quantized = any("int8_weight" in k for k in state_dict)
+            logger.log(f"Checkpoint is {'pre-quantized (int8)' if checkpoint_is_quantized else 'plain float (unquantized)'}.")
+
+            # Apply quantization-aware layer replacements.
+            # Install Int8Linear module structure only when the checkpoint already uses
+            # int8_weight keys.  For plain float checkpoints, always load with standard
+            # nn.Linear first to avoid key mismatches.
+            logger.log(f"Applying replacements (checkpoint_quantized={checkpoint_is_quantized}, fast_norm={not args.default_norm})...")
+            replace_linear_norm(model_arch, replace_linear=checkpoint_is_quantized, replace_norm=not args.default_norm, quantize=False)
 
             # Load weights
             logger.log("Loading weights into model...")
@@ -219,7 +230,7 @@ class TurboWanModelLoader:
             logger.log(f"✓ Successfully loaded model")
             logger.log(f"Model type: {args.model}")
             logger.log(f"Attention: {args.attention_type}")
-            logger.log(f"Quantized: {args.quant_linear}")
+            logger.log(f"Quantized: {checkpoint_is_quantized}")
 
             return model
 
