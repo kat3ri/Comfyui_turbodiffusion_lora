@@ -145,9 +145,21 @@ def create_model(dit_path: str, args: argparse.Namespace) -> torch.nn.Module:
         net = select_model(args.model)
 
     state_dict = load_state_dict(dit_path)
+
+    # Auto-detect whether the checkpoint already contains pre-quantized Int8Linear
+    # weights (indicated by the presence of 'int8_weight' keys).  The module
+    # structure installed before load_state_dict must match the checkpoint keys:
+    #   - pre-quantized checkpoint  → install Int8Linear structure (int8_weight / scale)
+    #   - plain float checkpoint    → keep nn.Linear structure (weight)
+    checkpoint_is_quantized = any("int8_weight" in k for k in state_dict)
+
     if args.attention_type in ['sla', 'sagesla']:
         net = replace_attention(net, attention_type=args.attention_type, sla_topk=args.sla_topk)
-    replace_linear_norm(net, replace_linear=args.quant_linear, replace_norm=not args.default_norm, quantize=False)
+
+    # Install Int8Linear module structure only when the checkpoint already uses
+    # int8_weight keys.  For plain float checkpoints, always load with standard
+    # nn.Linear first to avoid key mismatches.
+    replace_linear_norm(net, replace_linear=checkpoint_is_quantized, replace_norm=not args.default_norm, quantize=False)
     net.load_state_dict(state_dict, assign=True)
     net = net.to(tensor_kwargs["device"]).eval()
     del state_dict
