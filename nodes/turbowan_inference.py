@@ -38,14 +38,21 @@ class TurboDiffusionI2VSampler:
     - Dual-expert rCM sampling (high noise → low noise)
     - VAE decoding
     - Automatic memory management
+
+    Both ``high_noise_model`` and ``low_noise_model`` accept the ``MODEL``
+    output from either ``TurboWanModelLoader`` (base model) or
+    ``TurboWanLoRALoader`` (LoRA-merged model).  The LoRA-merged model is a
+    transparent drop-in replacement: it loads the base weights, merges the
+    LoRA delta, and applies the offload wrapper lazily on first ``.to(device)``
+    call — no other changes to this node are needed.
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "high_noise_model": ("MODEL", {"tooltip": "High noise expert model from TurboWanModelLoader"}),
-                "low_noise_model": ("MODEL", {"tooltip": "Low noise expert model from TurboWanModelLoader"}),
+                "high_noise_model": ("MODEL", {"tooltip": "High noise expert model from TurboWanModelLoader or TurboWanLoRALoader"}),
+                "low_noise_model": ("MODEL", {"tooltip": "Low noise expert model from TurboWanModelLoader or TurboWanLoRALoader"}),
                 "conditioning": ("CONDITIONING", {"tooltip": "Text conditioning from CLIPTextEncode"}),
                 "vae": ("VAE", {"tooltip": "Wan2.1 VAE from VAELoader"}),
                 "image": ("IMAGE", {"tooltip": "Starting image for I2V generation"}),
