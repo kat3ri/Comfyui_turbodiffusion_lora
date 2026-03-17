@@ -20,14 +20,24 @@ Quantized (``Int8Linear``) layers are silently skipped.
 
 Key-prefix remapping:
 
-  LoRA files trained on the original HuggingFace Wan model (e.g. via
-  diffusers/PEFT) typically use ``transformer.`` as the top-level module
-  prefix, while TurboDiffusion base models store weights under ``net.``.
-  The defaults ``lora_key_prefix="transformer."`` and
-  ``model_key_prefix="net."`` map between them automatically.
+  LoRA files trained on Wan models may use different top-level prefixes
+  depending on the training framework:
 
-  If your LoRA already uses ``net.`` keys, set ``lora_key_prefix`` to
-  ``"net."``.  If there is no prefix at all, set it to ``""``.
+  * ``diffusion_model.`` — used by many Wan LoRA trainers (e.g. MuseV,
+    VideoX-Fun).  This is the default ``lora_key_prefix``.
+  * ``transformer.`` — used by Diffusers/PEFT trainers.
+  * ``net.`` — used when the LoRA was saved from a TurboDiffusion checkpoint
+    directly.
+  * ``""`` — no prefix at all.
+
+  TurboDiffusion's WanModel stores its layers directly under ``blocks.*``
+  (no top-level prefix), so the default ``model_key_prefix`` is ``""``.
+
+  Auto-detection: when the specified ``lora_key_prefix`` does not match any
+  key in the LoRA file, the loader automatically tries the common prefixes
+  listed above and picks the first one that produces at least one match in
+  the model.  A warning is printed when auto-detection is used so users can
+  update the node settings for future runs.
 """
 
 import time
@@ -121,7 +131,54 @@ def _remap_key(lora_key: str, lora_prefix: str, model_prefix: str) -> str:
     """Strip *lora_prefix* from *lora_key* and prepend *model_prefix*."""
     if lora_prefix and lora_key.startswith(lora_prefix):
         return model_prefix + lora_key[len(lora_prefix) :]
+    if not lora_prefix:
+        return model_prefix + lora_key
     return lora_key
+
+
+# Common LoRA key prefixes, ordered by frequency in the wild.
+_KNOWN_LORA_PREFIXES = [
+    "diffusion_model.",
+    "transformer.",
+    "net.",
+    "model.",
+    "",
+]
+
+# Common model module prefixes.
+_KNOWN_MODEL_PREFIXES = ["", "net."]
+
+# Number of LoRA base keys sampled when validating / auto-detecting prefixes.
+_PREFIX_DETECTION_SAMPLE_SIZE = 30
+
+
+def _auto_detect_prefix_mapping(
+    lora_base_keys: list,
+    module_map: dict,
+) -> tuple:
+    """Try to auto-detect (lora_prefix, model_prefix) by testing known combos.
+
+    Scans up to the first :data:`_PREFIX_DETECTION_SAMPLE_SIZE` LoRA base keys
+    and tries every combination of :data:`_KNOWN_LORA_PREFIXES` ×
+    :data:`_KNOWN_MODEL_PREFIXES`.  Returns the first
+    ``(lora_prefix, model_prefix)`` pair that produces at least one hit in
+    *module_map*, or ``(None, None)`` when nothing matches.
+
+    Only keys that actually start with the candidate *lora_prefix* are
+    tested (for non-empty prefixes) to avoid false positives caused by
+    ``_remap_key`` returning the key unchanged when the prefix doesn't match.
+    """
+    sample = lora_base_keys[:_PREFIX_DETECTION_SAMPLE_SIZE]
+    for lp in _KNOWN_LORA_PREFIXES:
+        for mp in _KNOWN_MODEL_PREFIXES:
+            for key in sample:
+                # For non-empty prefixes, only consider keys that start with lp.
+                if lp and not key.startswith(lp):
+                    continue
+                remapped = _remap_key(key, lp, mp)
+                if remapped in module_map:
+                    return lp, mp
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +219,39 @@ def _apply_lora_to_module(
 
     n_applied = 0
     n_skipped = 0
+
+    # ------------------------------------------------------------------
+    # Prefix-mapping validation & auto-detection
+    # ------------------------------------------------------------------
+    lora_base_keys = list(pairs.keys())
+
+    # Check whether any key matches the caller-supplied prefixes.
+    any_match = any(
+        _remap_key(k, lora_key_prefix, model_key_prefix) in module_map
+        for k in lora_base_keys[:_PREFIX_DETECTION_SAMPLE_SIZE]
+    )
+
+    if not any_match and lora_base_keys:
+        detected_lp, detected_mp = _auto_detect_prefix_mapping(
+            lora_base_keys, module_map
+        )
+        if detected_lp is not None:
+            _log(
+                f"⚠ Specified prefix mapping '{lora_key_prefix}' → "
+                f"'{model_key_prefix}' produced no matches.  "
+                f"Auto-detected: '{detected_lp}' → '{detected_mp}'.  "
+                f"Update lora_key_prefix / model_key_prefix in the node "
+                f"to suppress this warning."
+            )
+            lora_key_prefix = detected_lp
+            model_key_prefix = detected_mp
+        else:
+            _log(
+                f"⚠ Could not find any matching layers for the provided "
+                f"LoRA keys.  Tried all known prefix combinations.  "
+                f"Check that the LoRA file was trained for this model "
+                f"architecture."
+            )
 
     for lora_base_key, matrices in pairs.items():
         if "down" not in matrices or "up" not in matrices:
@@ -376,9 +466,16 @@ class TurboWanLoRALoader:
     --------------------
     ``lora_key_prefix`` is stripped from every LoRA key and replaced with
     ``model_key_prefix`` before the corresponding model layer is looked up.
-    Defaults map **Diffusers** ``transformer.*`` keys to TurboDiffusion's
-    ``net.*`` namespace.  Change these if your LoRA was trained with a
-    different prefix scheme.
+
+    The default ``lora_key_prefix="diffusion_model."`` handles the most
+    common Wan LoRA format.  Use ``"transformer."`` for Diffusers/PEFT
+    LoRAs.  ``model_key_prefix`` defaults to ``""`` because TurboDiffusion's
+    WanModel stores layers directly under ``blocks.*`` with no top-level
+    prefix.
+
+    If the specified prefix produces no matches the loader will automatically
+    try all known prefix combinations and use the first one that works, so in
+    most cases no manual adjustment is needed.
     """
 
     @classmethod
@@ -406,22 +503,26 @@ class TurboWanLoRALoader:
                 "lora_key_prefix": (
                     "STRING",
                     {
-                        "default": "transformer.",
+                        "default": "diffusion_model.",
                         "tooltip": (
                             "Prefix used in LoRA keys.  "
-                            "Use 'transformer.' for Diffusers/PEFT LoRAs, "
+                            "Use 'diffusion_model.' for most Wan LoRAs, "
+                            "'transformer.' for Diffusers/PEFT LoRAs, "
                             "'net.' if the LoRA already uses net. keys, "
-                            "or '' if there is no prefix."
+                            "or '' if there is no prefix.  "
+                            "If the specified prefix produces no matches, "
+                            "the loader automatically tries all known prefixes."
                         ),
                     },
                 ),
                 "model_key_prefix": (
                     "STRING",
                     {
-                        "default": "net.",
+                        "default": "",
                         "tooltip": (
                             "Prefix used in TurboDiffusion model keys.  "
-                            "Default is 'net.'."
+                            "Default is '' (empty) because WanModel stores "
+                            "layers directly under blocks.*."
                         ),
                     },
                 ),
@@ -446,8 +547,8 @@ class TurboWanLoRALoader:
         model,
         lora_name: str,
         strength: float = 1.0,
-        lora_key_prefix: str = "transformer.",
-        model_key_prefix: str = "net.",
+        lora_key_prefix: str = "diffusion_model.",
+        model_key_prefix: str = "",
     ):
         """Return a lazy model loader that will merge LoRA on first use.
 
