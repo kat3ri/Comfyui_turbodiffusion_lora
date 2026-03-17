@@ -33,6 +33,7 @@ from .nodes.video_saver import TurboDiffusionSaveVideo
 from .nodes.turbowan_model_loader import TurboWanModelLoader
 from .nodes.turbowan_inference import TurboDiffusionI2VSampler
 from .nodes.vae_loader import TurboWanVAELoader
+from .nodes.lora_loader import TurboWanLoRALoader
 
 # ComfyUI node registration
 NODE_CLASS_MAPPINGS = {
@@ -41,6 +42,7 @@ NODE_CLASS_MAPPINGS = {
     "TurboWanModelLoader": TurboWanModelLoader,
     "TurboDiffusionI2VSampler": TurboDiffusionI2VSampler,
     "TurboWanVAELoader": TurboWanVAELoader,
+    "TurboWanLoRALoader": TurboWanLoRALoader,
 }
 
 # Display names for nodes in ComfyUI interface
@@ -50,6 +52,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TurboWanModelLoader": "TurboWan Model Loader (Quantized)",
     "TurboDiffusionI2VSampler": "TurboDiffusion I2V Sampler",
     "TurboWanVAELoader": "TurboWan VAE Loader",
+    "TurboWanLoRALoader": "TurboWan LoRA Loader",
 }
 
 # Web extensions (optional - for custom node UI)
@@ -66,6 +69,7 @@ __all__ = [
     "TurboWanModelLoader",
     "TurboDiffusionI2VSampler",
     "TurboWanVAELoader",
+    "TurboWanLoRALoader",
 ]
 
 # Print initialization message
@@ -78,6 +82,7 @@ for node_name, display_name in NODE_DISPLAY_NAME_MAPPINGS.items():
     print(f"  - {display_name} ({node_name})")
 print("\nFeatures:")
 print("  - TurboWan Model Loader: Official TurboDiffusion model loading")
+print("  - TurboWan LoRA Loader: Merge LoRA weights into unquantized models")
 print("  - Supports int8 block-wise quantized .pth models")
 print("  - SageSLA/SLA attention optimization for faster inference")
 print("  - Attention top-k tuning (0.01-1.0)")
