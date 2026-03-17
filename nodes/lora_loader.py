@@ -396,7 +396,8 @@ class TurboWanLoRALoader:
         "Supports Diffusers/PEFT (.lora_A / .lora_B) and Kohya "
         "(.lora_down / .lora_up) LoRA formats.  "
         "Merging is performed lazily on first inference.  "
-        "Use with unquantized model checkpoints only."
+        "Use with unquantized model checkpoints only.  "
+        "WARNING: LoRA files are loaded via pickle — only load files from trusted sources."
     )
 
     def load_lora(
@@ -422,7 +423,7 @@ class TurboWanLoRALoader:
         """
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
 
-        logger = TimedLogger("LoRALoader")
+        logger = TimedLogger("TurboWanLoRALoader")
         logger.section("Preparing LoRA Loader")
         logger.log(f"LoRA file   : {lora_name}")
         logger.log(f"Base model  : {getattr(model, 'model_name', 'unknown')}")
