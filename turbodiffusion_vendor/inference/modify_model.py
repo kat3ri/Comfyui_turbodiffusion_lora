@@ -1,25 +1,53 @@
 import argparse
 
 import torch
-from rcm.utils.model_utils import load_state_dict
-from rcm.networks.wan2pt1 import (
-    WanModel as WanModel2pt1,
-    WanLayerNorm as WanLayerNorm2pt1,
-    WanRMSNorm as WanRMSNorm2pt1,
-    WanSelfAttention as WanSelfAttention2pt1
-)
-from rcm.networks.wan2pt2 import (
-    WanModel as WanModel2pt2,
-    WanLayerNorm as WanLayerNorm2pt2,
-    WanRMSNorm as WanRMSNorm2pt2,
-    WanSelfAttention as WanSelfAttention2pt2
-)
 
-from ops import FastLayerNorm, FastRMSNorm, Int8Linear
-from SLA import (
-    SparseLinearAttention as SLA,
-    SageSparseLinearAttention as SageSLA
-)
+# SLA and ops are vendored local modules defined inside this repository under
+# turbodiffusion_vendor/SLA/ and turbodiffusion_vendor/ops/ — they are NOT
+# external pip packages.  When this file is imported as part of a parent package
+# we use explicit relative imports so the local nature is unambiguous.  The
+# bare-name fallback keeps the file runnable as a standalone script when
+# turbodiffusion_vendor/ is already on sys.path.
+try:
+    from ..rcm.utils.model_utils import load_state_dict
+    from ..rcm.networks.wan2pt1 import (
+        WanModel as WanModel2pt1,
+        WanLayerNorm as WanLayerNorm2pt1,
+        WanRMSNorm as WanRMSNorm2pt1,
+        WanSelfAttention as WanSelfAttention2pt1
+    )
+    from ..rcm.networks.wan2pt2 import (
+        WanModel as WanModel2pt2,
+        WanLayerNorm as WanLayerNorm2pt2,
+        WanRMSNorm as WanRMSNorm2pt2,
+        WanSelfAttention as WanSelfAttention2pt2
+    )
+    from ..ops import FastLayerNorm, FastRMSNorm, Int8Linear
+    from ..SLA import (
+        SparseLinearAttention as SLA,
+        SageSparseLinearAttention as SageSLA
+    )
+except ImportError:
+    # Fallback for direct script execution: turbodiffusion_vendor/ must be on
+    # sys.path (the base-repo convention when running from that directory).
+    from rcm.utils.model_utils import load_state_dict
+    from rcm.networks.wan2pt1 import (
+        WanModel as WanModel2pt1,
+        WanLayerNorm as WanLayerNorm2pt1,
+        WanRMSNorm as WanRMSNorm2pt1,
+        WanSelfAttention as WanSelfAttention2pt1
+    )
+    from rcm.networks.wan2pt2 import (
+        WanModel as WanModel2pt2,
+        WanLayerNorm as WanLayerNorm2pt2,
+        WanRMSNorm as WanRMSNorm2pt2,
+        WanSelfAttention as WanSelfAttention2pt2
+    )
+    from ops import FastLayerNorm, FastRMSNorm, Int8Linear
+    from SLA import (
+        SparseLinearAttention as SLA,
+        SageSparseLinearAttention as SageSLA
+    )
 
 
 def replace_attention(
