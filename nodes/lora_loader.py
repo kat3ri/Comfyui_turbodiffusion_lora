@@ -526,12 +526,22 @@ class LoRAMergedModelLoader(LazyModelLoader):
             start,
         )
 
-        # Step 1: load the base model to CPU only (target_device=None prevents
-        # any offload wrapper being applied inside _load_model_impl).
+        # Step 1: load the base model to CPU only.
+        # We pass target_device="cpu" explicitly (not None) because _load_model_impl
+        # has a fallback that reads lazy_loader._target_device when target_device is
+        # None.  If the base LazyModelLoader was previously moved to a CUDA device in
+        # the same ComfyUI session, that fallback would silently load the model to CUDA
+        # and wrap it with an offload wrapper *before* LoRA merging.  A wrapped model
+        # has a different named_modules() structure (e.g. blocks.0.module.self_attn.v
+        # instead of blocks.0.self_attn.v), causing all LoRA keys to be unresolvable
+        # (key mismatches).  It would also produce a double-wrapped model after Step 3
+        # below, which leads to the "mat1 is on cuda:0, different from other tensors on
+        # cpu" RuntimeError during inference.  Passing "cpu" bypasses the fallback and
+        # guarantees a plain, unwrapped nn.Module for the merge step.
         self._model = self.load_fn(
             self.model_path,
             self.load_args,
-            target_device=None,
+            target_device="cpu",
         )
 
         # Step 2: merge LoRA delta weights into the CPU model
