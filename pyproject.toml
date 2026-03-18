@@ -61,6 +61,8 @@ no-build-isolation-package = ["turbodiffusion"]
 addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.black]
 line-length = 100
 target-version = ["py39"]
 

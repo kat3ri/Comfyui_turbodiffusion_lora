@@ -88,7 +88,7 @@ def _make_model():
 # Tests: _parse_lora_keys
 # ---------------------------------------------------------------------------
 
-class TestParseLorAKeys:
+class TestParseLoraKeys:
     def test_peft_format(self):
         sd = {
             "diffusion_model.blocks.0.cross_attn.o.lora_A.weight": torch.randn(RANK, DIM),
