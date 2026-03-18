@@ -1,14 +1,19 @@
 """
 TurboWan LoRA Loader - Merge LoRA weights into unquantized TurboDiffusion models.
 
-Two LoRA key formats are supported:
+Four LoRA key formats are supported:
 
   Diffusers/PEFT  — keys end in ``.lora_A.weight`` / ``.lora_B.weight``
   Kohya           — keys end in ``.lora_down.weight`` / ``.lora_up.weight``
+  Direct weight   — keys end in ``.weight`` / ``.bias`` (full-rank delta,
+                    no low-rank decomposition)
+  Bare module     — keys are bare module paths with no ``.weight`` suffix
+                    (2-D tensor is treated as the weight delta)
 
 The merged weight delta for each LoRA layer is computed as::
 
-    delta_W = lora_up @ lora_down * (alpha / rank) * scale
+    delta_W = lora_up @ lora_down * (alpha / rank) * scale   (Diffusers/Kohya)
+    delta_W = tensor * scale                                   (Direct / Bare)
 
 where ``rank`` is inferred from the inner dimension of lora_down,
 ``alpha`` is read from the ``<base_key>.alpha`` key in the LoRA file
@@ -151,6 +156,16 @@ _KNOWN_MODEL_PREFIXES = ["", "net."]
 # Number of LoRA base keys sampled when validating / auto-detecting prefixes.
 _PREFIX_DETECTION_SAMPLE_SIZE = 30
 
+# Suffixes that identify the low-rank LoRA weight tensors.  Keys that end in
+# one of these are handled by ``_parse_lora_keys``; all other ``.weight`` /
+# ``.bias`` keys are treated as direct full-rank weight deltas.
+_LORA_WEIGHT_SUFFIXES = (
+    ".lora_A.weight",
+    ".lora_B.weight",
+    ".lora_down.weight",
+    ".lora_up.weight",
+)
+
 
 def _auto_detect_prefix_mapping(
     lora_base_keys: list,
@@ -181,6 +196,51 @@ def _auto_detect_prefix_mapping(
     return None, None
 
 
+def _parse_direct_weight_keys(lora_state_dict: dict) -> dict:
+    """Extract direct weight/bias delta entries from a state dict.
+
+    Handles two non-LoRA checkpoint formats:
+
+    * **Direct weight/bias** — keys ending in ``.weight`` or ``.bias`` that
+      are *not* a LoRA A/B or down/up tensor (i.e. not in
+      :data:`_LORA_WEIGHT_SUFFIXES`).  The key up to the suffix is treated as
+      the module path; the tensor is the full-rank delta to add.
+
+    * **Bare module-path** — keys that carry none of the known suffixes yet
+      whose tensor is 2-D (weight matrix) or 1-D (bias/scale vector).  The
+      key itself is treated as the module path and the tensor as the weight
+      delta.  1-D tensors are accepted so that single-vector parameters (e.g.
+      norm scales stored without a ``.weight`` suffix) can also be patched,
+      though in practice only 2-D ``nn.Linear`` weights are merged because the
+      target module must pass ``isinstance(module, nn.Linear)``.
+
+    Returns a dict mapping *module_path* (before prefix remapping) →
+    ``{"weight": tensor}`` and/or ``{"bias": tensor}``.
+    """
+    entries: dict = {}
+
+    _skip_suffixes = _LORA_WEIGHT_SUFFIXES + (".alpha",)
+
+    for key, tensor in lora_state_dict.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        # Skip keys already handled by _parse_lora_keys.
+        if any(key.endswith(s) for s in _skip_suffixes):
+            continue
+
+        if key.endswith(".weight"):
+            module_path = key[: -len(".weight")]
+            entries.setdefault(module_path, {})["weight"] = tensor
+        elif key.endswith(".bias"):
+            module_path = key[: -len(".bias")]
+            entries.setdefault(module_path, {})["bias"] = tensor
+        elif tensor.ndim in (1, 2):
+            # Bare module-path key — tensor is the weight (or bias) delta.
+            entries.setdefault(key, {})["weight"] = tensor
+
+    return entries
+
+
 # ---------------------------------------------------------------------------
 # Core LoRA-merge routine
 # ---------------------------------------------------------------------------
@@ -195,13 +255,24 @@ def _apply_lora_to_module(
 ) -> tuple:
     """Merge LoRA delta weights into *model* in-place (CPU).
 
+    Supports four checkpoint formats (see module docstring for details):
+
+    * Diffusers/PEFT  — ``.lora_A.weight`` / ``.lora_B.weight``
+    * Kohya           — ``.lora_down.weight`` / ``.lora_up.weight``
+    * Direct weight   — ``.weight`` / ``.bias`` full-rank delta keys
+    * Bare module     — bare module-path key, 2-D tensor = weight delta
+
     Only ``nn.Linear`` layers are targeted.  Any layer that is not a plain
     float ``nn.Linear`` (e.g. quantized ``Int8Linear`` layers) is silently
     skipped.
 
-    For each matched layer the weight update is::
+    For low-rank formats the weight update is::
 
         delta_W = lora_up @ lora_down * (alpha / rank) * strength
+
+    For direct/bare formats::
+
+        delta_W = tensor * strength
 
     Returns:
         Tuple ``(n_applied, n_skipped)`` — count of layers successfully
@@ -221,7 +292,7 @@ def _apply_lora_to_module(
     n_skipped = 0
 
     # ------------------------------------------------------------------
-    # Prefix-mapping validation & auto-detection
+    # Pass 1: low-rank LoRA format (lora_A/lora_B or lora_down/lora_up)
     # ------------------------------------------------------------------
     lora_base_keys = list(pairs.keys())
 
@@ -299,6 +370,90 @@ def _apply_lora_to_module(
         except Exception as exc:
             _log(f"Skip (error – {exc}): {model_key}")
             n_skipped += 1
+
+    # ------------------------------------------------------------------
+    # Pass 2: direct weight/bias delta format and bare module-path format
+    # ------------------------------------------------------------------
+    # Collect direct .weight / .bias / bare-path entries.
+    direct_entries = _parse_direct_weight_keys(lora_state_dict)
+
+    if direct_entries:
+        # Build remapped model keys using the prefix that was resolved in Pass 1.
+        remapped_direct: dict = {
+            _remap_key(k, lora_key_prefix, model_key_prefix): v
+            for k, v in direct_entries.items()
+        }
+
+        # Check whether any remapped key hits the module map.
+        sample_keys = list(remapped_direct.keys())[:_PREFIX_DETECTION_SAMPLE_SIZE]
+        direct_any_match = any(k in module_map for k in sample_keys)
+
+        if not direct_any_match:
+            # Prefix auto-detection for direct-weight format.
+            raw_paths = list(direct_entries.keys())
+            detected_lp, detected_mp = _auto_detect_prefix_mapping(raw_paths, module_map)
+            if detected_lp is not None:
+                _log(
+                    f"⚠ Direct-weight prefix mapping '{lora_key_prefix}' → "
+                    f"'{model_key_prefix}' produced no matches.  "
+                    f"Auto-detected: '{detected_lp}' → '{detected_mp}'."
+                )
+                remapped_direct = {
+                    _remap_key(k, detected_lp, detected_mp): v
+                    for k, v in direct_entries.items()
+                }
+
+        for model_key, tensors in remapped_direct.items():
+            module = module_map.get(model_key)
+            if module is None:
+                _log(f"Skip (no match, direct): {model_key}")
+                n_skipped += 1
+                continue
+
+            if not isinstance(module, nn.Linear) or not hasattr(module, "weight"):
+                _log(f"Skip (not nn.Linear, direct): {model_key}")
+                n_skipped += 1
+                continue
+
+            try:
+                applied_any = False
+
+                if "weight" in tensors:
+                    delta_w = tensors["weight"].to(torch.float32)
+                    if delta_w.shape != module.weight.shape:
+                        _log(
+                            f"Skip (shape mismatch – delta={delta_w.shape}, "
+                            f"model={module.weight.shape}): {model_key}"
+                        )
+                        n_skipped += 1
+                        continue
+                    delta = (delta_w * strength).to(
+                        dtype=module.weight.data.dtype,
+                        device=module.weight.data.device,
+                    )
+                    module.weight.data.add_(delta)
+                    applied_any = True
+
+                if "bias" in tensors and module.bias is not None:
+                    delta_b = tensors["bias"].to(torch.float32)
+                    if delta_b.shape == module.bias.shape:
+                        delta = (delta_b * strength).to(
+                            dtype=module.bias.data.dtype,
+                            device=module.bias.data.device,
+                        )
+                        module.bias.data.add_(delta)
+                        applied_any = True
+
+                if applied_any:
+                    _log(f"Merged (direct delta): {model_key}")
+                    n_applied += 1
+                else:
+                    _log(f"Skip (no applicable delta): {model_key}")
+                    n_skipped += 1
+
+            except Exception as exc:
+                _log(f"Skip (error – {exc}): {model_key}")
+                n_skipped += 1
 
     return n_applied, n_skipped
 
@@ -445,15 +600,20 @@ class LoRAMergedModelLoader(LazyModelLoader):
 class TurboWanLoRALoader:
     """Merge a LoRA checkpoint into an unquantized TurboDiffusion model.
 
-    Two LoRA key formats are supported:
+    Four LoRA key formats are supported:
 
     * **Diffusers / PEFT** — keys end in ``.lora_A.weight`` /
       ``.lora_B.weight``
     * **Kohya** — keys end in ``.lora_down.weight`` / ``.lora_up.weight``
+    * **Direct weight/bias** — keys end in ``.weight`` / ``.bias`` (full-rank
+      delta, no low-rank decomposition)
+    * **Bare module-path** — key is a bare module path (no ``.weight`` suffix),
+      2-D tensor is treated as the weight delta
 
     The merged weight delta for each LoRA layer is::
 
-        delta_W = lora_up @ lora_down * (alpha / rank) * strength
+        delta_W = lora_up @ lora_down * (alpha / rank) * strength   (Diffusers/Kohya)
+        delta_W = tensor * strength                                   (Direct/Bare)
 
     Only unquantized (plain float ``nn.Linear``) layers are merged.
     Quantized (``Int8Linear``) layers are skipped automatically.
@@ -534,8 +694,9 @@ class TurboWanLoRALoader:
     CATEGORY = "loaders"
     DESCRIPTION = (
         "Merge a LoRA checkpoint into an unquantized TurboDiffusion model.  "
-        "Supports Diffusers/PEFT (.lora_A / .lora_B) and Kohya "
-        "(.lora_down / .lora_up) LoRA formats.  "
+        "Supports Diffusers/PEFT (.lora_A / .lora_B), Kohya "
+        "(.lora_down / .lora_up), direct full-rank weight delta (.weight / .bias), "
+        "and bare module-path LoRA formats.  "
         "Accepts .safetensors files (safe, recommended) and legacy .pt/.pth "
         "pickle checkpoints.  "
         "Merging is performed lazily on first inference.  "
@@ -580,16 +741,22 @@ class TurboWanLoRALoader:
         lora_state_dict = _load_lora_state_dict(str(lora_path))
 
         # Summarise what was found
-        suffixes = (
+        lora_suffixes = (
             ".lora_A.weight",
             ".lora_B.weight",
             ".lora_down.weight",
             ".lora_up.weight",
         )
         n_lora_tensors = sum(
-            1 for k in lora_state_dict if any(k.endswith(s) for s in suffixes)
+            1 for k in lora_state_dict if any(k.endswith(s) for s in lora_suffixes)
         )
-        logger.log(f"Found {n_lora_tensors} LoRA weight tensors in checkpoint")
+        n_direct_tensors = len(_parse_direct_weight_keys(lora_state_dict))
+        if n_lora_tensors:
+            logger.log(f"Found {n_lora_tensors} low-rank LoRA weight tensors in checkpoint")
+        if n_direct_tensors:
+            logger.log(f"Found {n_direct_tensors} direct weight delta entries in checkpoint")
+        if not n_lora_tensors and not n_direct_tensors:
+            logger.log("⚠ No recognizable LoRA weight tensors found in checkpoint")
         logger.log("✓ LoRA loader created (merge happens on first model use)")
         print("=" * 60)
         print()
