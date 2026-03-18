@@ -85,6 +85,11 @@ class _FakeLazyModelLoader:
         self.model_name = model_name
         self.load_fn = load_fn
         self.load_args = load_args
+        self._model = None
+        self._loaded = False
+        self._load_time = None
+        self._target_device = None
+        self._target_kwargs = {}
 
 _stub(f"{_PKG_NAME}.utils.lazy_loader", LazyModelLoader=_FakeLazyModelLoader)
 

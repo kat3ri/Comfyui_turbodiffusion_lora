@@ -35,6 +35,7 @@ from nodes.lora_loader import (  # noqa: E402
     _apply_lora_to_module,
     _remap_key,
     _auto_detect_prefix_mapping,
+    LoRAMergedModelLoader,
 )
 
 
@@ -489,6 +490,136 @@ class TestNonLinearSkipped:
         )
         assert n_applied == 0
         assert n_skipped == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: LoRAMergedModelLoader always loads base model to CPU
+# ---------------------------------------------------------------------------
+
+class TestLoRAMergedModelLoaderCPULoad:
+    """Verify that _ensure_loaded always passes target_device="cpu" to load_fn.
+
+    The root cause of both the key-mismatch and the device-mismatch bugs was
+    that _ensure_loaded passed target_device=None, which allowed
+    _load_model_impl to fall back to base_loader._target_device.  If the base
+    loader had previously been moved to CUDA (e.g. because it was also wired
+    directly to an inference node in the same ComfyUI session), the model would
+    be loaded with an offload wrapper already applied.  This produced two
+    problems:
+
+      1. Key mismatch — named_modules() of a LayerwiseGPUOffloadWrapper yields
+         keys like "blocks.0.module.self_attn.v", not "blocks.0.self_attn.v",
+         so every LoRA key lookup failed.
+      2. Device mismatch — a second offload wrapper was applied on top of the
+         first, causing the "mat1 is on cuda:0, different from other tensors on
+         cpu" RuntimeError during inference.
+
+    The fix: pass target_device="cpu" so the fallback is bypassed and the
+    returned model is always a plain, unwrapped nn.Module on CPU.
+    """
+
+    def _make_lora_loader(self, base_target_device, lora_state_dict,
+                          lora_key_prefix="", model_key_prefix=""):
+        """Create a LoRAMergedModelLoader backed by a fake load_fn.
+
+        Returns (loader, recorded_dict) where recorded_dict["target_device"]
+        will hold the target_device value that load_fn received.
+        """
+        recorded = {}
+
+        def load_fn(path, load_args, target_device=None):
+            recorded["target_device"] = target_device
+            return _make_model()
+
+        from Comfyui_turbodiffusion_lora.utils.lazy_loader import LazyModelLoader as _FLL
+
+        base_loader = _FLL(
+            model_path="fake_path",
+            model_name="fake_model",
+            load_fn=load_fn,
+            load_args=None,
+        )
+        # Simulate a base loader that was (or wasn't) previously moved to CUDA.
+        base_loader._target_device = base_target_device
+
+        loader = LoRAMergedModelLoader(
+            base_loader=base_loader,
+            lora_state_dict=lora_state_dict,
+            strength=1.0,
+            lora_key_prefix=lora_key_prefix,
+            model_key_prefix=model_key_prefix,
+            lora_name="test.safetensors",
+        )
+        # Keep _target_device=None so the offload wrapper path is not entered.
+        loader._target_device = None
+        return loader, recorded
+
+    def test_cpu_passed_when_base_target_device_is_none(self):
+        """load_fn must receive target_device='cpu' even when base loader has no CUDA target."""
+        lora_sd = {
+            "blocks.0.self_attn.q.lora_down.weight": torch.randn(RANK, DIM),
+            "blocks.0.self_attn.q.lora_up.weight": torch.randn(DIM, RANK),
+        }
+        loader, recorded = self._make_lora_loader(base_target_device=None, lora_state_dict=lora_sd)
+        loader._ensure_loaded()
+        assert recorded.get("target_device") == "cpu", (
+            "_ensure_loaded must pass target_device='cpu' to load_fn, "
+            f"but got {recorded.get('target_device')!r}"
+        )
+
+    def test_cpu_passed_when_base_target_device_is_cuda(self):
+        """load_fn must receive target_device='cpu' even when base loader targets CUDA.
+
+        This is the critical scenario: if base_loader._target_device was set to
+        a CUDA device (because the base model was used directly in the same
+        session), passing None would have caused load_fn to load the model to
+        CUDA with an offload wrapper applied, breaking LoRA key resolution and
+        causing a double-wrap device mismatch.
+        """
+        lora_sd = {
+            "blocks.0.self_attn.v.lora_down.weight": torch.randn(RANK, DIM),
+            "blocks.0.self_attn.v.lora_up.weight": torch.randn(DIM, RANK),
+        }
+        loader, recorded = self._make_lora_loader(
+            base_target_device="cuda:0", lora_state_dict=lora_sd
+        )
+        loader._ensure_loaded()
+        assert recorded.get("target_device") == "cpu", (
+            "_ensure_loaded must pass target_device='cpu' to load_fn, "
+            f"but got {recorded.get('target_device')!r}"
+        )
+        assert loader._loaded is True
+
+    def test_lora_applied_after_cpu_load(self):
+        """LoRA weights must be correctly merged when base loader had CUDA target.
+
+        With the previous bug (target_device=None), if base_loader._target_device
+        was 'cuda:0', load_fn would load the model wrapped and the module map
+        would use wrong key paths — causing all LoRA key lookups to fail.
+        """
+        lora_down = torch.randn(RANK, DIM)
+        lora_up = torch.randn(DIM, RANK)
+        lora_sd = {
+            "diffusion_model.blocks.0.self_attn.q.lora_down.weight": lora_down,
+            "diffusion_model.blocks.0.self_attn.q.lora_up.weight": lora_up,
+        }
+        loader, _ = self._make_lora_loader(
+            base_target_device="cuda:0",
+            lora_state_dict=lora_sd,
+            lora_key_prefix="diffusion_model.",
+            model_key_prefix="",
+        )
+        loader._ensure_loaded()
+
+        model = loader._model
+        expected = (lora_up @ lora_down).to(model.blocks[0].self_attn.q.weight.dtype)
+        assert torch.allclose(
+            model.blocks[0].self_attn.q.weight.data,
+            expected,
+            atol=1e-5,
+        ), "LoRA delta was not applied — key mismatch likely occurred"
+
+
 
 
 if __name__ == "__main__":
